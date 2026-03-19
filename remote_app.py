@@ -1,68 +1,27 @@
 #!/usr/bin/env python3
-"""USB Camera Web Interface for Raspberry Pi with human detection."""
+"""Remote processing and UI server for Rober.
+
+Runs on a more powerful machine. Fetches raw frames from the Pi hardware server,
+runs MobileNet SSD detection, and serves the web UI.
+"""
 
 import threading
 import time
 import os
 import io
-import subprocess
+import argparse
 from flask import Flask, Response, render_template_string, jsonify, request, send_file
 import cv2
 import numpy as np
-from gpiozero import OutputDevice
-from adafruit_pca9685 import PCA9685
-from adafruit_motor import servo as adafruit_servo
-import board
+import requests as http_requests
 
 app = Flask(__name__)
 
-# --- Flywheel relay on BCM GPIO 17 (BOARD pin 11) ---
-# Relay is active-low: pin LOW = relay ON, pin HIGH = relay OFF
-_flywheel_relay = OutputDevice(17, active_high=False, initial_value=False)
-flywheel_on = False
-
-# --- Trigger relay on BCM GPIO 27 (BOARD pin 13) ---
-# Relay is active-low: pin LOW = relay ON, pin HIGH = relay OFF
-_trigger_relay = OutputDevice(27, active_high=False, initial_value=False)
-trigger_on = False
-
-# --- PCA9685 Servos on channels 0 and 2 ---
-# IMPORTANT: We bypass ServoKit and PCA9685's built-in reset() to prevent servos
-# from jerking on service restart / reboot. PCA9685.__init__ calls self.reset()
-# which writes 0x00 to MODE1, and the frequency setter briefly sleeps the chip.
-# Both of these interrupt PWM output and cause brusque servo movements.
-# Instead, we suppress reset() during init and only set frequency if prescale
-# is wrong. No angle is commanded — servos stay where they physically are.
-_pca = None
-_servo_objs = {}
-try:
-    i2c = board.I2C()
-    # Suppress reset() during __init__ to avoid disrupting PWM output
-    _orig_reset = PCA9685.reset
-    PCA9685.reset = lambda self: None
-    _pca = PCA9685(i2c, address=0x40)
-    PCA9685.reset = _orig_reset  # restore immediately
-    # Only set frequency if prescale is not already 50Hz (prescale=121 for 25MHz/50Hz)
-    current_prescale = _pca.prescale_reg
-    if current_prescale != 121:
-        _pca.frequency = 50
-    else:
-        # Already at 50Hz — just ensure auto-increment and oscillator are enabled
-        # without the sleep/wake cycle that kills PWM
-        _pca.mode1_reg = _pca.mode1_reg | 0xA0
-    # Create servo objects on channels 0 and 2 — does NOT command any angle
-    _servo_objs[0] = adafruit_servo.Servo(_pca.channels[0])
-    _servo_objs[2] = adafruit_servo.Servo(_pca.channels[2])
-except (ValueError, OSError) as e:
-    print(f"WARNING: PCA9685 servo controller not found ({e}). Servo disabled.")
-    _pca = None
-servo_angles = {0: 90.0, 2: 90.0}
-servo_targets = {0: 90.0, 2: 90.0}
-_servo_lock = threading.Lock()
-
 # --- Configuration ---
+PI_URL = os.environ.get('PI_URL', 'http://192.168.1.105:927')
+
 CONFIDENCE_THRESHOLD = 0.4
-PERSON_CLASS = 15  # "person" in MobileNet SSD VOC classes
+PERSON_CLASS = 15
 DETECTION_HOLD_FRAMES = 15
 
 # --- Load model ---
@@ -73,9 +32,6 @@ net = cv2.dnn.readNetFromCaffe(
 )
 
 # --- Shared state ---
-zoom_level = 1.0
-focus_value = 150
-cam_ref = None  # reference to active camera for focus control
 latest_frame = None
 frame_lock = threading.Lock()
 detection_boxes = []
@@ -83,140 +39,29 @@ detection_lock = threading.Lock()
 human_detected = False
 human_count = 0
 target_centered = False
-aim_direction = ""  # e.g. "left", "up right", etc.
-sweep_active = False
+aim_direction = ""
 
 
-def usb_reset_camera():
-    """Reset the Arducam by kernel-level USB deauthorize/reauthorize.
-
-    uhubctl does not work on this Pi 3 ('No compatible devices detected'),
-    so we use the sysfs authorized flag which forces the kernel to fully
-    disconnect and re-enumerate the USB device — equivalent to a physical
-    unplug/replug cycle.
-    """
-    USB_AUTH = '/sys/bus/usb/devices/1-1.4/authorized'
-    try:
-        # Deauthorize (disconnect)
-        with open(USB_AUTH, 'w') as f:
-            f.write('0')
-        time.sleep(2)
-        # Reauthorize (re-enumerate)
-        with open(USB_AUTH, 'w') as f:
-            f.write('1')
-        time.sleep(3)
-        # Reset UVC quirks to sane default (0xFFFFFFFF has been seen and breaks streaming)
-        try:
-            with open('/sys/module/uvcvideo/parameters/quirks', 'w') as f:
-                f.write('0')
-        except OSError:
-            pass
-        print("USB kernel reset completed.")
-    except Exception as e:
-        print(f"USB kernel reset failed: {e}")
-        # Fallback: try usbreset utility
-        try:
-            subprocess.run(['usbreset', 'Arducam_12MP'], timeout=10, capture_output=True)
-            time.sleep(3)
-            print("Fallback usbreset completed.")
-        except Exception as e2:
-            print(f"Fallback usbreset also failed: {e2}")
-
-
-def open_camera():
-    """Try to open a working USB camera, return the VideoCapture or None.
-    Uses a timeout thread to avoid blocking forever on a stuck camera."""
-    for idx in range(5):
-        c = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-        if c.isOpened():
-            c.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            c.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-            c.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-            c.set(cv2.CAP_PROP_FPS, 30)
-            c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            c.set(cv2.CAP_PROP_SHARPNESS, 5)
-            # Use a thread to timeout the initial read (stuck cameras block here)
-            result = [False]
-            def try_read():
-                ret, _ = c.read()
-                result[0] = ret
-            t = threading.Thread(target=try_read, daemon=True)
-            t.start()
-            t.join(timeout=5)  # 5 second timeout for first frame
-            if t.is_alive():
-                print(f"Camera {idx} blocked on read (stuck firmware), releasing...")
-                c.release()
-                continue
-            if result[0]:
-                return c
-            c.release()
-    return None
-
-
-def camera_reader():
-    """Dedicated thread: reads frames as fast as possible, keeps only the latest.
-    Auto-recovers if the camera stops delivering frames."""
-    global latest_frame, cam_ref
-    MAX_FAILURES = 30  # consecutive failures before reconnect
-    consecutive_open_failures = 0
-
+def frame_fetcher():
+    """Continuously fetch raw frames from the Pi hardware server."""
+    global latest_frame
+    session = http_requests.Session()
     while True:
-        cap = open_camera()
-        if cap is None:
-            consecutive_open_failures += 1
-            if consecutive_open_failures >= 2:
-                print("Camera stuck after 2 attempts, trying USB power cycle...")
-                usb_reset_camera()
-                consecutive_open_failures = 0
-            else:
-                print(f"WARNING: No working camera found (attempt {consecutive_open_failures}), retrying in 3s...")
-                time.sleep(3)
-            continue
-        consecutive_open_failures = 0
-
-        cam_ref = cap
-        print("Camera opened successfully.")
-        fail_count = 0
-        read_timeout_count = 0
-        while True:
-            # Use a thread to timeout reads (stuck cameras block cap.read())
-            result = [False, None]
-            def do_read():
-                ret, frame = cap.read()
-                result[0] = ret
-                result[1] = frame
-            t = threading.Thread(target=do_read, daemon=True)
-            t.start()
-            t.join(timeout=3)  # 3 second timeout per frame read
-            if t.is_alive():
-                read_timeout_count += 1
-                print(f"Camera read blocked (timeout {read_timeout_count})...")
-                if read_timeout_count >= 3:
-                    print("Camera firmware stuck, forcing USB power cycle...")
-                    cap.release()
-                    usb_reset_camera()
-                    break
-                continue
-            read_timeout_count = 0
-            ret, frame = result
-            if ret:
-                fail_count = 0
-                frame = cv2.flip(frame, -1)  # flip 180 degrees (upside down camera)
-                with frame_lock:
-                    latest_frame = frame
-            else:
-                fail_count += 1
-                if fail_count >= MAX_FAILURES:
-                    print(f"Camera failed {MAX_FAILURES} consecutive reads, reconnecting...")
-                    break
-                time.sleep(0.03)
-
-        cap.release()
-        time.sleep(1)  # brief pause before reconnect
+        try:
+            r = session.get(f'{PI_URL}/raw_frame', timeout=3)
+            if r.status_code == 200:
+                arr = np.frombuffer(r.content, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    with frame_lock:
+                        latest_frame = frame
+            time.sleep(0.03)
+        except Exception:
+            time.sleep(1)
 
 
 def detection_worker():
-    """Dedicated thread: runs person detection on latest frame without blocking streaming."""
+    """Runs person detection on latest frame."""
     global detection_boxes, human_detected, human_count, target_centered, aim_direction
     hold = 0
 
@@ -228,10 +73,9 @@ def detection_worker():
             time.sleep(0.05)
             continue
 
-        # Apply current zoom before detection
-        zoomed = apply_zoom(frame, zoom_level)
-        h, w = zoomed.shape[:2]
-        blob = cv2.dnn.blobFromImage(zoomed, 0.007843, (300, 300), 127.5)
+        # Frames from Pi are already zoomed
+        h, w = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(frame, 0.007843, (300, 300), 127.5)
         net.setInput(blob)
         detections = net.forward()
 
@@ -246,13 +90,11 @@ def detection_worker():
                 y2 = min(h, int(detections[0, 0, i, 6] * h))
                 boxes.append((x1, y1, x2 - x1, y2 - y1))
 
-        # Check if any target head is near center of frame (~20% threshold)
         centered = False
         direction = ""
         cx, cy = w // 2, h // 2
         thresh_x, thresh_y = w // 5, h // 5
         if len(boxes) > 0:
-            # Use the first (most confident) detection
             bx, by, bw, bh = boxes[0]
             head_x = bx + bw // 2
             head_y = by + int(bh * 0.1)
@@ -290,123 +132,7 @@ def detection_worker():
                     human_detected = False
                     human_count = 0
 
-        time.sleep(0.03)  # run as fast as inference allows
-
-
-def apply_zoom(frame, level):
-    """Crop center of frame based on zoom level, then resize back."""
-    if level <= 1.0:
-        return frame
-    h, w = frame.shape[:2]
-    crop_w = int(w / level)
-    crop_h = int(h / level)
-    x1 = (w - crop_w) // 2
-    y1 = (h - crop_h) // 2
-    cropped = frame[y1:y1 + crop_h, x1:x1 + crop_w]
-    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
-
-
-def servo_smooth_worker():
-    """Server-side smooth interpolation — moves servos in tiny steps at steady 100Hz.
-    Releases PWM (angle=None) after servo is idle to prevent buzzing.
-    When re-engaging after release, ramps up gradually to avoid jerk."""
-    MAX_STEP = 0.3  # max degrees per tick (0.3 deg * 100Hz = 30 deg/sec)
-    IDLE_TICKS = 50  # release PWM after ~0.5s idle (50 ticks * 10ms)
-    RAMP_TICKS = 30  # gradual ramp-up over ~0.3s when re-engaging
-    idle_count = {0: 0, 2: 0}
-    servo_released = {0: True, 2: True}  # start released (no PWM on boot)
-    ramp_count = {0: 0, 2: 0}  # counts up during re-engagement ramp
-    while True:
-        if _pca is None:
-            time.sleep(1)
-            continue
-        with _servo_lock:
-            for ch in (0, 2):
-                current = servo_angles[ch]
-                target = servo_targets[ch]
-                diff = target - current
-                if abs(diff) < 0.02:
-                    idle_count[ch] += 1
-                    if idle_count[ch] >= IDLE_TICKS and not servo_released[ch]:
-                        # Release PWM to stop buzzing/vibration
-                        try:
-                            _servo_objs[ch].angle = None
-                        except Exception:
-                            pass
-                        servo_released[ch] = True
-                        ramp_count[ch] = 0
-                    continue
-                idle_count[ch] = 0
-                # Re-engaging after PWM was released: ramp up step size gradually
-                # to avoid a sudden jerk from the servo snapping to the commanded angle
-                if servo_released[ch]:
-                    servo_released[ch] = False
-                    ramp_count[ch] = 0
-                if ramp_count[ch] < RAMP_TICKS:
-                    ramp_count[ch] += 1
-                    # Scale step from near-zero up to MAX_STEP over RAMP_TICKS
-                    ramp_factor = ramp_count[ch] / RAMP_TICKS
-                    effective_max = MAX_STEP * ramp_factor
-                else:
-                    effective_max = MAX_STEP
-                step = max(-effective_max, min(effective_max, diff))
-                new_angle = current + step
-                new_angle = max(0.0, min(180.0, new_angle))
-                try:
-                    _servo_objs[ch].angle = new_angle
-                except Exception:
-                    pass
-                servo_angles[ch] = new_angle
-        time.sleep(0.01)  # 100Hz
-
-
-def sweep_worker():
-    """Continuously sweeps servo targets back and forth independently.
-    When sweep is deactivated, smoothly returns targets to center at the same pace."""
-    global sweep_active
-    # Each servo sweeps its own range independently
-    LIMITS = {0: (0.0, 180.0), 2: (40.0, 100.0)}
-    SWEEP_STEP = 0.5   # degrees per tick during sweep
-    RETURN_STEP = 0.5   # degrees per tick when returning to center (same pace)
-    CENTER = 90.0
-    direction = {0: 1, 2: 1}  # 1 = toward max, -1 = toward min
-
-    while True:
-        if _pca is None:
-            time.sleep(0.1)
-            continue
-
-        if sweep_active:
-            with _servo_lock:
-                for ch in (0, 2):
-                    lo, hi = LIMITS[ch]
-                    current_target = servo_targets[ch]
-                    # If reached the limit, reverse direction
-                    if current_target >= hi:
-                        direction[ch] = -1
-                    elif current_target <= lo:
-                        direction[ch] = 1
-                    servo_targets[ch] = current_target + direction[ch] * SWEEP_STEP
-        else:
-            # Smoothly return targets to center at the same rate as sweep
-            with _servo_lock:
-                all_centered = True
-                for ch in (0, 2):
-                    current_target = servo_targets[ch]
-                    diff = CENTER - current_target
-                    if abs(diff) < RETURN_STEP:
-                        # Close enough — let smooth worker glide to exact center
-                        # instead of snapping (which causes a jerk)
-                        servo_targets[ch] = CENTER
-                    else:
-                        all_centered = False
-                        step = max(-RETURN_STEP, min(RETURN_STEP, diff))
-                        servo_targets[ch] = current_target + step
-            if all_centered:
-                time.sleep(0.1)
-                continue
-
-        time.sleep(0.05)  # update targets at 20Hz, smooth worker handles actual movement
+        time.sleep(0.03)
 
 
 def draw_target(frame, head_x, head_y, r):
@@ -423,7 +149,7 @@ def draw_target(frame, head_x, head_y, r):
 
 
 def generate_frames():
-    """Generator that yields MJPEG frames with overlays. No detection here — just drawing."""
+    """Generator that yields MJPEG frames with detection overlays."""
     while True:
         with frame_lock:
             frame = latest_frame
@@ -432,9 +158,8 @@ def generate_frames():
             time.sleep(0.03)
             continue
 
-        frame = apply_zoom(frame.copy(), zoom_level)
+        frame = frame.copy()
 
-        # Draw detection overlays from the detection thread
         with detection_lock:
             boxes = detection_boxes.copy()
             detected = human_detected
@@ -452,21 +177,32 @@ def generate_frames():
             cv2.putText(frame, label, (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
 
-        # Timestamp
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         cv2.putText(frame, ts, (10, frame.shape[0] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        # Zoom indicator
-        if zoom_level > 1.0:
-            cv2.putText(frame, f"{zoom_level:.1f}x", (frame.shape[1] - 80, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-
         _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
-        time.sleep(0.033)  # ~30fps cap to prevent flooding
+        time.sleep(0.033)
 
+
+# --- Helper for proxying POST requests to Pi ---
+def proxy_post(endpoint):
+    """Forward a POST request to the Pi and return its response."""
+    try:
+        r = http_requests.post(
+            f'{PI_URL}{endpoint}',
+            json=request.get_json(force=True),
+            timeout=3
+        )
+        return (r.content, r.status_code,
+                {'Content-Type': r.headers.get('Content-Type', 'application/json')})
+    except http_requests.RequestException as e:
+        return jsonify(error=f'Pi unreachable: {e}'), 502
+
+
+# --- Routes ---
 
 @app.route('/')
 def index():
@@ -486,7 +222,7 @@ def single_frame():
         frame = latest_frame
     if frame is None:
         return "No frame", 503
-    frame = apply_zoom(frame.copy(), zoom_level)
+    frame = frame.copy()
 
     with detection_lock:
         boxes = detection_boxes.copy()
@@ -507,9 +243,6 @@ def single_frame():
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     cv2.putText(frame, ts, (10, frame.shape[0] - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    if zoom_level > 1.0:
-        cv2.putText(frame, f"{zoom_level:.1f}x", (frame.shape[1] - 80, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
     _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return Response(buf.tobytes(), mimetype='image/jpeg',
@@ -525,108 +258,64 @@ def single_frame():
 
 @app.route('/sounds/<filename>')
 def serve_sound(filename):
-    """Serve voice clip WAV files."""
     sounds_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sounds')
     return send_file(os.path.join(sounds_dir, filename), mimetype='audio/wav')
 
 
 @app.route('/set_zoom', methods=['POST'])
 def set_zoom():
-    global zoom_level
-    data = request.get_json(force=True)
-    zoom_level = max(1.0, min(5.0, float(data.get('zoom', 1.0))))
-    return jsonify(zoom=zoom_level)
+    return proxy_post('/set_zoom')
 
 
 @app.route('/set_focus', methods=['POST'])
 def set_focus():
-    global focus_value
-    data = request.get_json(force=True)
-    focus_value = max(1, min(1023, int(data.get('focus', 150))))
-    subprocess.run(['/usr/bin/v4l2-ctl', '-d', '/dev/video0',
-                    '--set-ctrl=focus_automatic_continuous=0',
-                    f'--set-ctrl=focus_absolute={focus_value}'],
-                   timeout=2)
-    return jsonify(focus=focus_value)
-
-
-@app.route('/snapshot')
-def snapshot():
-    with frame_lock:
-        frame = latest_frame
-    if frame is None:
-        return "Camera error", 500
-    frame = apply_zoom(frame.copy(), zoom_level)
-    _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    return send_file(
-        io.BytesIO(buf.tobytes()),
-        mimetype='image/jpeg',
-        as_attachment=True,
-        download_name=f'snapshot_{time.strftime("%Y%m%d_%H%M%S")}.jpg'
-    )
-
-
-@app.route('/flywheel', methods=['POST'])
-def flywheel_control():
-    global flywheel_on
-    data = request.get_json(force=True)
-    state = bool(data.get('state', False))
-    if state:
-        _flywheel_relay.on()
-    else:
-        _flywheel_relay.off()
-    flywheel_on = state
-    return jsonify(flywheel=flywheel_on)
-
-
-@app.route('/trigger', methods=['POST'])
-def trigger_control():
-    global trigger_on
-    data = request.get_json(force=True)
-    state = bool(data.get('state', False))
-    if state:
-        _trigger_relay.on()
-    else:
-        _trigger_relay.off()
-    trigger_on = state
-    return jsonify(trigger=trigger_on)
+    return proxy_post('/set_focus')
 
 
 @app.route('/servo', methods=['POST'])
 def servo_control():
-    data = request.get_json(force=True)
-    channel = int(data.get('channel', 0))
-    if channel not in (0, 2):
-        return jsonify(error='Invalid channel'), 400
-    if _pca is None:
-        return jsonify(angle=0, error='Servo controller not connected')
-    angle = max(0, min(180, float(data.get('angle', 0))))
-    with _servo_lock:
-        servo_targets[channel] = angle
-    return jsonify(channel=channel, angle=angle)
+    return proxy_post('/servo')
 
 
 @app.route('/sweep', methods=['POST'])
 def sweep_control():
-    global sweep_active
-    data = request.get_json(force=True)
-    state = bool(data.get('state', False))
-    sweep_active = state
-    # When deactivated, sweep_worker handles smooth return to center
-    return jsonify(sweep=sweep_active)
+    return proxy_post('/sweep')
+
+
+@app.route('/flywheel', methods=['POST'])
+def flywheel_control():
+    return proxy_post('/flywheel')
+
+
+@app.route('/trigger', methods=['POST'])
+def trigger_control():
+    return proxy_post('/trigger')
+
+
+@app.route('/snapshot')
+def snapshot():
+    try:
+        r = http_requests.get(f'{PI_URL}/snapshot', timeout=5)
+        return Response(r.content, mimetype='image/jpeg',
+                        headers={
+                            'Content-Disposition': r.headers.get('Content-Disposition', ''),
+                        })
+    except http_requests.RequestException as e:
+        return f'Pi unreachable: {e}', 502
 
 
 @app.route('/status')
 def status():
-    return jsonify(
-        zoom=zoom_level,
+    try:
+        pi_status = http_requests.get(f'{PI_URL}/status', timeout=3).json()
+    except Exception:
+        pi_status = {}
+    pi_status.update(
         human_detected=human_detected,
         human_count=human_count,
         target_centered=target_centered,
-        flywheel=flywheel_on,
-        trigger=trigger_on,
-        servo_angles=servo_angles
     )
+    return jsonify(pi_status)
 
 
 # ─── Inline HTML/CSS/JS ───
@@ -851,7 +540,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     fetching = true;
     fetch('/frame?' + Date.now())
       .then(r => {
-        // Read detection state from headers
         const isHuman = r.headers.get('X-Human') === '1';
         const count = r.headers.get('X-Count') || '0';
         const centered = r.headers.get('X-Centered') === '1';
@@ -864,7 +552,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
           badge.textContent = 'Monitoring';
           badge.classList.remove('alert');
         }
-        // Sound: gunshot if centered, direction tones if off-center, silence if no human
         if (isHuman && centered) {
           updateSound(true, '');
         } else if (isHuman && direction) {
@@ -889,12 +576,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   fetchFrame();
 
-  // --- Sound system (all Web Audio API, no speechSynthesis) ---
+  // --- Sound system ---
   let audioCtx = null;
   let soundEnabled = false;
   let shotTimer = null;
   let dirTimer = null;
-  let currentSound = '';  // 'shot' or direction string
+  let currentSound = '';
   const soundBtn = document.getElementById('sound-btn');
 
   function enableSound() {
@@ -907,7 +594,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     audioCtx.resume();
-    // Unlock audio and load voice clips
     playTone(440, 0.1, 0.3);
     loadVoiceClips();
     soundEnabled = true;
@@ -964,7 +650,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     noise.stop(t + 0.15);
   }
 
-  // Voice direction - use fetch to load WAV as ArrayBuffer, decode via AudioContext
   const voiceBuffers = {};
   function loadVoiceClips() {
     ['up','down','left','right'].forEach(d => {
@@ -1046,16 +731,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
   }
 
-  // --- Joystick control (servo 0 = L/R, servo 2 = U/D) ---
+  // --- Joystick control ---
   const joystick = document.getElementById('joystick');
   const knob = document.getElementById('joystick-knob');
   let joyActive = false;
   let joyRect = null;
-  // Target angles — server does all smoothing
   let targetX = 90, targetY = 90;
   let lastSentX = 90, lastSentY = 90;
 
-  // Send target to server periodically (no client-side interpolation)
   setInterval(() => {
     if (Math.abs(targetX - lastSentX) > 0.5 || Math.abs(targetY - lastSentY) > 0.5) {
       sendServo(0, targetX);
@@ -1070,13 +753,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const r = joyRect.width / 2;
     let dx = clientX - (joyRect.left + r);
     let dy = clientY - (joyRect.top + r);
-    // Clamp to circle
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist > r) { dx = dx / dist * r; dy = dy / dist * r; }
-    // Position knob
     knob.style.left = (r + dx) + 'px';
     knob.style.top = (r + dy) + 'px';
-    // Map to target servo angles (full range)
     targetX = Math.round(90 - (dx / r) * 90);
     targetY = Math.round(90 - (dy / r) * 90);
     targetX = Math.max(0, Math.min(180, targetX));
@@ -1098,7 +778,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   function joyEnd() {
     joyActive = false;
-    // Keep knob and servos at current position
   }
 
   joystick.addEventListener('mousedown', (e) => {
@@ -1153,15 +832,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </html>
 """
 
-# Start background threads before Flask
-cam_thread = threading.Thread(target=camera_reader, daemon=True)
-cam_thread.start()
-det_thread = threading.Thread(target=detection_worker, daemon=True)
-det_thread.start()
-servo_thread = threading.Thread(target=servo_smooth_worker, daemon=True)
-servo_thread.start()
-sweep_thread = threading.Thread(target=sweep_worker, daemon=True)
-sweep_thread.start()
+# Start background threads
+threading.Thread(target=frame_fetcher, daemon=True).start()
+threading.Thread(target=detection_worker, daemon=True).start()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=927, threaded=True)
+    parser = argparse.ArgumentParser(description='Rober remote processing server')
+    parser.add_argument('--pi-url', default=os.environ.get('PI_URL', 'http://192.168.1.105:927'),
+                        help='URL of the Pi hardware server')
+    parser.add_argument('--port', type=int, default=5000, help='Port to listen on')
+    args = parser.parse_args()
+    PI_URL = args.pi_url
+    app.run(host='0.0.0.0', port=args.port, threaded=True)
