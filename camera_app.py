@@ -56,8 +56,8 @@ try:
 except (ValueError, OSError) as e:
     print(f"WARNING: PCA9685 servo controller not found ({e}). Servo disabled.")
     _pca = None
-servo_angles = {0: 90.0, 2: 90.0}
-servo_targets = {0: 90.0, 2: 90.0}
+servo_angles = {0: 90.0, 2: 110.0}
+servo_targets = {0: 90.0, 2: 110.0}
 _servo_lock = threading.Lock()
 
 # --- Configuration ---
@@ -308,14 +308,16 @@ def apply_zoom(frame, level):
 
 def servo_smooth_worker():
     """Server-side smooth interpolation — moves servos in tiny steps at steady 100Hz.
-    Releases PWM (angle=None) after servo is idle to prevent buzzing.
-    When re-engaging after release, ramps up gradually to avoid jerk."""
+    Releases PWM after 10s idle at rest position to silence servo noise.
+    On re-engagement, re-applies last angle first (minimal drift over short idle)."""
     MAX_STEP = 0.3  # max degrees per tick (0.3 deg * 100Hz = 30 deg/sec)
-    IDLE_TICKS = 50  # release PWM after ~0.5s idle (50 ticks * 10ms)
-    RAMP_TICKS = 30  # gradual ramp-up over ~0.3s when re-engaging
+    IDLE_RELEASE_TICKS = 1000  # release PWM after 10s idle (1000 * 10ms)
+    # On boot, servos have no PWM yet. We must not command any angle until the
+    # user actually provides input (changes the target from its initial value).
+    first_move_seen = {0: False, 2: False}
+    last_written = {0: None, 2: None}
     idle_count = {0: 0, 2: 0}
     servo_released = {0: True, 2: True}  # start released (no PWM on boot)
-    ramp_count = {0: 0, 2: 0}  # counts up during re-engagement ramp
     while True:
         if _pca is None:
             time.sleep(1)
@@ -326,36 +328,45 @@ def servo_smooth_worker():
                 target = servo_targets[ch]
                 diff = target - current
                 if abs(diff) < 0.02:
-                    idle_count[ch] += 1
-                    if idle_count[ch] >= IDLE_TICKS and not servo_released[ch]:
-                        # Release PWM to stop buzzing/vibration
-                        try:
-                            _servo_objs[ch].angle = None
-                        except Exception:
-                            pass
-                        servo_released[ch] = True
-                        ramp_count[ch] = 0
+                    if not servo_released[ch]:
+                        idle_count[ch] += 1
+                        if idle_count[ch] >= IDLE_RELEASE_TICKS:
+                            try:
+                                _servo_objs[ch].angle = None
+                            except Exception:
+                                pass
+                            servo_released[ch] = True
                     continue
                 idle_count[ch] = 0
-                # Re-engaging after PWM was released: ramp up step size gradually
-                # to avoid a sudden jerk from the servo snapping to the commanded angle
+                # First time this servo is being moved since boot
+                if not first_move_seen[ch]:
+                    first_move_seen[ch] = True
+                    servo_angles[ch] = target
+                    try:
+                        _servo_objs[ch].angle = target
+                    except Exception:
+                        pass
+                    last_written[ch] = target
+                    continue
+                # Re-engaging after PWM release: re-apply last known angle first
                 if servo_released[ch]:
                     servo_released[ch] = False
-                    ramp_count[ch] = 0
-                if ramp_count[ch] < RAMP_TICKS:
-                    ramp_count[ch] += 1
-                    # Scale step from near-zero up to MAX_STEP over RAMP_TICKS
-                    ramp_factor = ramp_count[ch] / RAMP_TICKS
-                    effective_max = MAX_STEP * ramp_factor
-                else:
-                    effective_max = MAX_STEP
-                step = max(-effective_max, min(effective_max, diff))
+                    try:
+                        _servo_objs[ch].angle = current
+                    except Exception:
+                        pass
+                    last_written[ch] = round(current, 1)
+                    continue  # one tick for PWM to stabilize
+                step = max(-MAX_STEP, min(MAX_STEP, diff))
                 new_angle = current + step
                 new_angle = max(0.0, min(180.0, new_angle))
-                try:
-                    _servo_objs[ch].angle = new_angle
-                except Exception:
-                    pass
+                rounded = round(new_angle, 1)
+                if rounded != last_written[ch]:
+                    try:
+                        _servo_objs[ch].angle = new_angle
+                    except Exception:
+                        pass
+                    last_written[ch] = rounded
                 servo_angles[ch] = new_angle
         time.sleep(0.01)  # 100Hz
 
@@ -365,10 +376,10 @@ def sweep_worker():
     When sweep is deactivated, smoothly returns targets to center at the same pace."""
     global sweep_active
     # Each servo sweeps its own range independently
-    LIMITS = {0: (0.0, 180.0), 2: (40.0, 100.0)}
+    LIMITS = {0: (0.0, 180.0), 2: (30.0, 110.0)}
     SWEEP_STEP = 0.5   # degrees per tick during sweep
     RETURN_STEP = 0.5   # degrees per tick when returning to center (same pace)
-    CENTER = 90.0
+    CENTER = {0: 90.0, 2: 110.0}
     direction = {0: 1, 2: 1}  # 1 = toward max, -1 = toward min
 
     while True:
@@ -381,7 +392,6 @@ def sweep_worker():
                 for ch in (0, 2):
                     lo, hi = LIMITS[ch]
                     current_target = servo_targets[ch]
-                    # If reached the limit, reverse direction
                     if current_target >= hi:
                         direction[ch] = -1
                     elif current_target <= lo:
@@ -393,11 +403,11 @@ def sweep_worker():
                 all_centered = True
                 for ch in (0, 2):
                     current_target = servo_targets[ch]
-                    diff = CENTER - current_target
+                    diff = CENTER[ch] - current_target
                     if abs(diff) < RETURN_STEP:
                         # Close enough — let smooth worker glide to exact center
                         # instead of snapping (which causes a jerk)
-                        servo_targets[ch] = CENTER
+                        servo_targets[ch] = CENTER[ch]
                     else:
                         all_centered = False
                         step = max(-RETURN_STEP, min(RETURN_STEP, diff))
@@ -616,6 +626,21 @@ def sweep_control():
     return jsonify(sweep=sweep_active)
 
 
+@app.route('/reset', methods=['POST'])
+def reset_all():
+    """Stop sweep, flywheel, trigger, and return servos to center."""
+    global sweep_active, flywheel_on, trigger_on
+    sweep_active = False
+    _flywheel_relay.off()
+    flywheel_on = False
+    _trigger_relay.off()
+    trigger_on = False
+    with _servo_lock:
+        servo_targets[0] = 90.0
+        servo_targets[2] = 110.0
+    return jsonify(ok=True)
+
+
 @app.route('/status')
 def status():
     return jsonify(
@@ -736,6 +761,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .joystick-wrap {
     display: flex; align-items: center; gap: 16px;
   }
+  .btn-reset {
+    background: linear-gradient(135deg, #666, #444); color: #fff;
+    font-size: 0.85rem; padding: 10px 18px; align-self: center;
+  }
   .joystick-container {
     position: relative; width: 150px; height: 150px;
     background: conic-gradient(#ff0000, #ff8800, #ffff00, #00cc00, #0088ff, #8800ff, #ff0000);
@@ -747,7 +776,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: radial-gradient(circle, #fff, #ddd);
     border: 2px solid rgba(0,0,0,0.3);
     border-radius: 50%;
-    top: 50%; left: 50%; transform: translate(-50%, -50%);
+    top: 38.9%; left: 50%; transform: translate(-50%, -50%);
     pointer-events: none;
     box-shadow: 0 0 10px rgba(0,0,0,0.4);
   }
@@ -784,6 +813,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
         <div class="joystick-label">L/R: pan &middot; U/D: tilt</div>
       </div>
+      <button class="btn btn-reset" onclick="resetAll()">RESET</button>
     </div>
 
     <div class="zoom-row">
@@ -993,6 +1023,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
   }
 
+  // --- Reset all ---
+  function resetAll() {
+    fetch('/reset', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({})
+    });
+    // Update UI state to match
+    sweepActive = false;
+    sweepBtn.classList.remove('on');
+    sweepBtn.textContent = 'SWEEP';
+    flywheelActive = false;
+    flywheelBtn.classList.remove('on');
+    flywheelBtn.textContent = 'FLYWHEEL';
+    triggerActive = false;
+    triggerBtn.classList.remove('on');
+    // Reset joystick knob to resting position (X=center, Y=up for 110°)
+    // Y mapping: targetY = 90 - (dy/r)*90, so for 110°: dy/r = -20/90
+    knob.style.left = '50%';
+    knob.style.top = (50 - 20/90 * 50).toFixed(1) + '%';
+    joyRect = null;
+    targetX = 90; targetY = 110;
+    lastSentX = 90; lastSentY = 110;
+  }
+
   // --- Sweep toggle ---
   const sweepBtn = document.getElementById('sweep-btn');
   let sweepActive = false;
@@ -1052,8 +1107,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   let joyActive = false;
   let joyRect = null;
   // Target angles — server does all smoothing
-  let targetX = 90, targetY = 90;
-  let lastSentX = 90, lastSentY = 90;
+  let targetX = 90, targetY = 110;
+  let lastSentX = 90, lastSentY = 110;
 
   // Send target to server periodically (no client-side interpolation)
   setInterval(() => {
@@ -1080,7 +1135,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     targetX = Math.round(90 - (dx / r) * 90);
     targetY = Math.round(90 - (dy / r) * 90);
     targetX = Math.max(0, Math.min(180, targetX));
-    targetY = Math.max(40, Math.min(100, targetY));
+    targetY = Math.max(30, Math.min(110, targetY));
   }
 
   let servoThrottle = {};
