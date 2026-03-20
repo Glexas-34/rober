@@ -658,78 +658,50 @@ def draw_aim_zone(frame):
     cv2.line(frame, (cx, cy - arm), (cx, cy + arm), (0, 255, 255), 2)
 
 
-# --- Pre-encoded stream frame (background thread encodes, generators just yield) ---
-_stream_buf = None
-_stream_lock = threading.Lock()
-STREAM_W, STREAM_H = 640, 360  # downscaled for fast encode + transfer
-
-
-def stream_encoder():
-    """Background thread: encodes stream frames at reduced resolution."""
-    global _stream_buf
-    prev_frame_id = None
+def generate_frames():
+    """Generator that yields MJPEG frames with overlays."""
     while True:
         with frame_lock:
             frame = latest_frame
+
         if frame is None:
-            time.sleep(0.01)
+            time.sleep(0.03)
             continue
-        # Skip if same frame object (no new camera read)
-        fid = id(frame)
-        if fid == prev_frame_id:
-            time.sleep(0.005)
-            continue
-        prev_frame_id = fid
 
         frame = apply_zoom(frame.copy(), zoom_level)
-        # Downscale for stream
-        small = cv2.resize(frame, (STREAM_W, STREAM_H), interpolation=cv2.INTER_NEAREST)
-        draw_aim_zone(small)
+        draw_aim_zone(frame)
 
+        # Draw detection overlays from the detection thread
         with detection_lock:
             boxes = detection_boxes.copy()
             detected = human_detected
             count = human_count
 
         if detected and boxes:
-            # Scale detection boxes to stream resolution
-            fh, fw = frame.shape[:2]
-            sx, sy = STREAM_W / fw, STREAM_H / fh
             for (x, y, w, h) in boxes:
-                rx, ry, rw, rh = int(x*sx), int(y*sy), int(w*sx), int(h*sy)
-                cv2.rectangle(small, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), 2)
-                head_x = rx + rw // 2
-                head_y = ry + int(rh * 0.1)
-                r = max(12, rw // 6)
-                draw_target(small, head_x, head_y, r)
-            cv2.putText(small, f"HUMAN DETECTED ({count})", (8, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                head_x = x + w // 2
+                head_y = y + int(h * 0.1)
+                r = max(18, w // 6)
+                draw_target(frame, head_x, head_y, r)
 
+            label = f"HUMAN DETECTED ({count})"
+            cv2.putText(frame, label, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+        # Timestamp
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        cv2.putText(small, ts, (8, STREAM_H - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.putText(frame, ts, (10, frame.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # Zoom indicator
         if zoom_level > 1.0:
-            cv2.putText(small, f"{zoom_level:.1f}x", (STREAM_W - 60, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(frame, f"{zoom_level:.1f}x", (frame.shape[1] - 80, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-        _, buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 60])
-        encoded = (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
-        with _stream_lock:
-            _stream_buf = encoded
-
-
-def generate_frames():
-    """Generator that yields pre-encoded MJPEG frames."""
-    prev = None
-    while True:
-        with _stream_lock:
-            buf = _stream_buf
-        if buf is None or buf is prev:
-            time.sleep(0.005)
-            continue
-        prev = buf
-        yield buf
+        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
 
 
 @app.route('/')
@@ -1210,37 +1182,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     window.location.href = '/snapshot';
   }
 
-  // MJPEG stream for low-latency video (single persistent connection)
+  // Use MJPEG stream for lowest latency video
   const feed = document.getElementById('feed');
   feed.src = '/video_feed';
-
-  // Lightweight status poll for detection badges and sound
-  function pollStatus() {
-    fetch('/status')
-      .then(r => r.json())
-      .then(data => {
-        const isHuman = data.human_detected;
-        const count = data.human_count;
-        const centered = data.target_centered;
-        const direction = data.aim_direction || '';
-        if (isHuman) {
-          badge.textContent = 'Human Detected (' + count + ')';
-          badge.classList.add('alert');
-        } else {
-          badge.textContent = 'Monitoring';
-          badge.classList.remove('alert');
-        }
-        if (isHuman && centered) {
-          updateSound(true, '');
-        } else if (isHuman && direction) {
-          updateSound(false, direction);
-        } else {
-          updateSound(false, '');
-        }
-      })
-      .catch(() => {});
-  }
-  setInterval(pollStatus, 200);
 
   // --- Sound system (all Web Audio API, no speechSynthesis) ---
   let audioCtx = null;
@@ -1613,6 +1557,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
         const dy = (ay - 65) / 35 * r;
         knob.style.left = (r + dx) + 'px';
         knob.style.top = (r + dy) + 'px';
+        // Detection state from status
+        const isHuman = data.human_detected;
+        const count = data.human_count || 0;
+        const centered = data.target_centered;
+        const direction = data.aim_direction || '';
+        if (isHuman) {
+          badge.textContent = 'Human Detected (' + count + ')';
+          badge.classList.add('alert');
+        } else {
+          badge.textContent = 'Monitoring';
+          badge.classList.remove('alert');
+        }
+        if (isHuman && centered) {
+          updateSound(true, '');
+        } else if (isHuman && direction) {
+          updateSound(false, direction);
+        } else {
+          updateSound(false, '');
+        }
       })
       .catch(() => {});
   }, 200);
@@ -1823,8 +1786,6 @@ sweep_thread = threading.Thread(target=sweep_worker, daemon=True)
 sweep_thread.start()
 track_shoot_thread = threading.Thread(target=track_shoot_worker, daemon=True)
 track_shoot_thread.start()
-stream_thread = threading.Thread(target=stream_encoder, daemon=True)
-stream_thread.start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=927, threaded=True)
