@@ -5,6 +5,7 @@ import threading
 import time
 import os
 import io
+import json
 import subprocess
 from flask import Flask, Response, render_template_string, jsonify, request, send_file
 import cv2
@@ -56,14 +57,26 @@ try:
 except (ValueError, OSError) as e:
     print(f"WARNING: PCA9685 servo controller not found ({e}). Servo disabled.")
     _pca = None
-servo_angles = {0: 90.0, 2: 110.0}
-servo_targets = {0: 90.0, 2: 110.0}
+servo_angles = {0: 88.0, 2: 67.0}
+servo_targets = {0: 88.0, 2: 67.0}
 _servo_lock = threading.Lock()
 
 # --- Configuration ---
 CONFIDENCE_THRESHOLD = 0.4
 PERSON_CLASS = 15  # "person" in MobileNet SSD VOC classes
 DETECTION_HOLD_FRAMES = 15
+
+# --- Calibration: where the gun actually points (normalized 0-1, default=center) ---
+CALIBRATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'calibration.json')
+calibration = {'x': 0.5, 'y': 0.5}  # normalized coords within frame
+try:
+    with open(CALIBRATION_FILE, 'r') as _cf:
+        _cal_data = json.load(_cf)
+        calibration['x'] = float(_cal_data.get('x', 0.5))
+        calibration['y'] = float(_cal_data.get('y', 0.5))
+    print(f"Calibration loaded: x={calibration['x']:.3f}, y={calibration['y']:.3f}")
+except (FileNotFoundError, json.JSONDecodeError, ValueError):
+    print("No calibration file found, using center default.")
 
 # --- Load model ---
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
@@ -85,6 +98,12 @@ human_count = 0
 target_centered = False
 aim_direction = ""  # e.g. "left", "up right", etc.
 sweep_active = False
+track_shoot_active = False
+track_dx = 0  # pixel offset of target from center (positive = target is right)
+track_dy = 0  # pixel offset of target from center (positive = target is down)
+track_frame_w = 1  # frame width for normalizing offsets
+track_frame_h = 1  # frame height for normalizing offsets
+
 
 
 def usb_reset_camera():
@@ -201,7 +220,7 @@ def camera_reader():
             ret, frame = result
             if ret:
                 fail_count = 0
-                frame = cv2.flip(frame, -1)  # flip 180 degrees (upside down camera)
+                # Camera is mounted right-side up, no flip needed
                 with frame_lock:
                     latest_frame = frame
             else:
@@ -218,6 +237,7 @@ def camera_reader():
 def detection_worker():
     """Dedicated thread: runs person detection on latest frame without blocking streaming."""
     global detection_boxes, human_detected, human_count, target_centered, aim_direction
+    global track_dx, track_dy, track_frame_w, track_frame_h
     hold = 0
 
     while True:
@@ -246,11 +266,13 @@ def detection_worker():
                 y2 = min(h, int(detections[0, 0, i, 6] * h))
                 boxes.append((x1, y1, x2 - x1, y2 - y1))
 
-        # Check if any target head is near center of frame (~20% threshold)
+        # Check if any target head is near the calibrated aim point
         centered = False
         direction = ""
-        cx, cy = w // 2, h // 2
-        thresh_x, thresh_y = w // 5, h // 5
+        cx = int(calibration['x'] * w)
+        cy = int(calibration['y'] * h)
+        thresh_x, thresh_y = w * 4 // 75, h * 8 // 75
+        raw_dx, raw_dy = 0, 0
         if len(boxes) > 0:
             # Use the first (most confident) detection
             bx, by, bw, bh = boxes[0]
@@ -258,6 +280,7 @@ def detection_worker():
             head_y = by + int(bh * 0.1)
             dx = head_x - cx
             dy = head_y - cy
+            raw_dx, raw_dy = dx, dy
             if abs(dx) < thresh_x and abs(dy) < thresh_y:
                 centered = True
             else:
@@ -273,6 +296,10 @@ def detection_worker():
                 direction = " ".join(parts)
 
         with detection_lock:
+            track_dx = raw_dx
+            track_dy = raw_dy
+            track_frame_w = w
+            track_frame_h = h
             if len(boxes) > 0:
                 detection_boxes = boxes
                 human_detected = True
@@ -306,81 +333,165 @@ def apply_zoom(frame, level):
     return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
+def _recover_pca9685():
+    """Attempt to recover a PCA9685 that has stopped outputting PWM.
+
+    Common causes: power glitch from relay switching causes chip brownout/reset,
+    putting it back into default sleep mode (MODE1=0x11). Also handles I2C bus
+    errors by re-initializing the bus.
+
+    Returns True if recovery succeeded, False otherwise.
+    """
+    global _pca, _servo_objs
+    try:
+        mode1 = _pca.mode1_reg
+        # Check if chip is asleep (bit 4 = SLEEP). Default after reset is 0x11.
+        if mode1 & 0x10:
+            print(f"PCA9685 recovery: chip was asleep (MODE1=0x{mode1:02X}), waking up...")
+            # Clear SLEEP bit, keep AI (auto-increment)
+            _pca.mode1_reg = (mode1 & ~0x10) | 0x20
+            time.sleep(0.005)  # oscillator stabilization (500us min per datasheet)
+            # Set RESTART bit to resume PWM from where it was
+            _pca.mode1_reg = _pca.mode1_reg | 0x80
+            print("PCA9685 recovery: chip woken, RESTART issued.")
+
+        # Verify/fix prescale (should be 121 for 50Hz)
+        prescale = _pca.prescale_reg
+        if prescale != 121:
+            print(f"PCA9685 recovery: prescale was {prescale}, resetting to 121 (50Hz)...")
+            # Must sleep chip to change prescale
+            cur = _pca.mode1_reg
+            _pca.mode1_reg = (cur & ~0x80) | 0x10  # SLEEP=1, clear RESTART
+            time.sleep(0.005)
+            _pca.prescale_reg = 121
+            _pca.mode1_reg = cur & ~0x10  # clear SLEEP
+            time.sleep(0.005)
+            _pca.mode1_reg = _pca.mode1_reg | 0x80  # RESTART
+
+        # Ensure AI + oscillator enabled
+        _pca.mode1_reg = _pca.mode1_reg | 0xA0
+        print(f"PCA9685 recovery: OK (MODE1=0x{_pca.mode1_reg:02X}, prescale={_pca.prescale_reg})")
+        return True
+
+    except OSError as e:
+        print(f"PCA9685 recovery: I2C still failing ({e}), attempting full re-init...")
+        try:
+            # Full re-init: new I2C bus + new PCA9685 object
+            i2c = board.I2C()
+            orig_reset = PCA9685.reset
+            PCA9685.reset = lambda self: None
+            _pca = PCA9685(i2c, address=0x40)
+            PCA9685.reset = orig_reset
+            if _pca.prescale_reg != 121:
+                _pca.frequency = 50
+            else:
+                _pca.mode1_reg = _pca.mode1_reg | 0xA0
+            _servo_objs[0] = adafruit_servo.Servo(_pca.channels[0])
+            _servo_objs[2] = adafruit_servo.Servo(_pca.channels[2])
+            print("PCA9685 recovery: full re-init succeeded.")
+            return True
+        except Exception as e2:
+            print(f"PCA9685 recovery: full re-init failed ({e2}).")
+            return False
+
+
 def servo_smooth_worker():
     """Server-side smooth interpolation — moves servos in tiny steps at steady 100Hz.
-    Releases PWM after 10s idle at rest position to silence servo noise.
-    On re-engagement, re-applies last angle first (minimal drift over short idle)."""
+    PWM is never released — servos hold position permanently.
+    Includes automatic recovery if PCA9685 stops responding."""
     MAX_STEP = 0.3  # max degrees per tick (0.3 deg * 100Hz = 30 deg/sec)
-    IDLE_RELEASE_TICKS = 1000  # release PWM after 10s idle (1000 * 10ms)
     # On boot, servos have no PWM yet. We must not command any angle until the
     # user actually provides input (changes the target from its initial value).
     first_move_seen = {0: False, 2: False}
     last_written = {0: None, 2: None}
-    idle_count = {0: 0, 2: 0}
-    servo_released = {0: True, 2: True}  # start released (no PWM on boot)
+    consecutive_errors = 0
+    RECOVERY_THRESHOLD = 5  # attempt recovery after this many consecutive I2C errors
+    HEALTH_CHECK_INTERVAL = 5.0  # seconds between proactive health checks
+    last_health_check = time.monotonic()
+
     while True:
         if _pca is None:
             time.sleep(1)
             continue
+
+        now = time.monotonic()
+
+        # Proactive health check: verify PCA9685 is still awake even when
+        # no servo commands are being sent (catches silent brownout resets)
+        if now - last_health_check >= HEALTH_CHECK_INTERVAL:
+            last_health_check = now
+            try:
+                mode1 = _pca.mode1_reg
+                if mode1 & 0x10:  # SLEEP bit set = chip reset itself
+                    print(f"PCA9685 health check: chip asleep (MODE1=0x{mode1:02X}), recovering...")
+                    if _recover_pca9685():
+                        consecutive_errors = 0
+                        # Force re-send of current angles to restore PWM output
+                        last_written[0] = None
+                        last_written[2] = None
+            except OSError:
+                consecutive_errors += 1
+
         with _servo_lock:
             for ch in (0, 2):
                 current = servo_angles[ch]
                 target = servo_targets[ch]
                 diff = target - current
-                if abs(diff) < 0.02:
-                    if not servo_released[ch]:
-                        idle_count[ch] += 1
-                        if idle_count[ch] >= IDLE_RELEASE_TICKS:
-                            try:
-                                _servo_objs[ch].angle = None
-                            except Exception:
-                                pass
-                            servo_released[ch] = True
+                if abs(diff) < 0.02 and last_written[ch] is not None:
                     continue
-                idle_count[ch] = 0
                 # First time this servo is being moved since boot
                 if not first_move_seen[ch]:
+                    if abs(diff) < 0.02:
+                        continue  # no user input yet, stay idle
                     first_move_seen[ch] = True
                     servo_angles[ch] = target
                     try:
-                        _servo_objs[ch].angle = target
-                    except Exception:
-                        pass
+                        hw_angle = (130.0 - target) if ch == 2 else target
+                        _servo_objs[ch].angle = hw_angle
+                        consecutive_errors = 0
+                    except OSError as e:
+                        consecutive_errors += 1
+                        print(f"Servo ch{ch} write error ({consecutive_errors}): {e}")
                     last_written[ch] = target
                     continue
-                # Re-engaging after PWM release: re-apply last known angle first
-                if servo_released[ch]:
-                    servo_released[ch] = False
-                    try:
-                        _servo_objs[ch].angle = current
-                    except Exception:
-                        pass
-                    last_written[ch] = round(current, 1)
-                    continue  # one tick for PWM to stabilize
                 step = max(-MAX_STEP, min(MAX_STEP, diff))
                 new_angle = current + step
                 new_angle = max(0.0, min(180.0, new_angle))
                 rounded = round(new_angle, 1)
                 if rounded != last_written[ch]:
                     try:
-                        _servo_objs[ch].angle = new_angle
-                    except Exception:
-                        pass
+                        hw_angle = (130.0 - new_angle) if ch == 2 else new_angle
+                        _servo_objs[ch].angle = hw_angle
+                        consecutive_errors = 0
+                    except OSError as e:
+                        consecutive_errors += 1
+                        if consecutive_errors % RECOVERY_THRESHOLD == 0:
+                            print(f"Servo ch{ch}: {consecutive_errors} consecutive I2C errors, recovering...")
+                            if _recover_pca9685():
+                                consecutive_errors = 0
+                                last_written[0] = None
+                                last_written[2] = None
+                                break  # restart the loop to re-send angles
                     last_written[ch] = rounded
                 servo_angles[ch] = new_angle
-        time.sleep(0.01)  # 100Hz
+
+        # Back off slightly when errors are happening to avoid hammering a dead bus
+        if consecutive_errors > 0:
+            time.sleep(0.05)
+        else:
+            time.sleep(0.01)  # 100Hz
 
 
 def sweep_worker():
     """Continuously sweeps servo targets back and forth independently.
-    When sweep is deactivated, smoothly returns targets to center at the same pace."""
+    When sweep is deactivated, smoothly returns targets to center once, then idles."""
     global sweep_active
-    # Each servo sweeps its own range independently
-    LIMITS = {0: (0.0, 180.0), 2: (30.0, 110.0)}
-    SWEEP_STEP = 0.5   # degrees per tick during sweep
-    RETURN_STEP = 0.5   # degrees per tick when returning to center (same pace)
-    CENTER = {0: 90.0, 2: 110.0}
-    direction = {0: 1, 2: 1}  # 1 = toward max, -1 = toward min
+    LIMITS = {0: (0.0, 180.0), 2: (30.0, 100.0)}
+    SWEEP_STEP = 0.5
+    RETURN_STEP = 0.5
+    CENTER = {0: 88.0, 2: 67.0}
+    direction = {0: 1, 2: 1}
+    was_sweeping = False  # track whether we need to return to center
 
     while True:
         if _pca is None:
@@ -388,6 +499,7 @@ def sweep_worker():
             continue
 
         if sweep_active:
+            was_sweeping = True
             with _servo_lock:
                 for ch in (0, 2):
                     lo, hi = LIMITS[ch]
@@ -397,26 +509,124 @@ def sweep_worker():
                     elif current_target <= lo:
                         direction[ch] = 1
                     servo_targets[ch] = current_target + direction[ch] * SWEEP_STEP
-        else:
-            # Smoothly return targets to center at the same rate as sweep
+        elif was_sweeping:
+            # Sweep just stopped — smoothly return to center, then stop
             with _servo_lock:
                 all_centered = True
                 for ch in (0, 2):
                     current_target = servo_targets[ch]
                     diff = CENTER[ch] - current_target
                     if abs(diff) < RETURN_STEP:
-                        # Close enough — let smooth worker glide to exact center
-                        # instead of snapping (which causes a jerk)
                         servo_targets[ch] = CENTER[ch]
                     else:
                         all_centered = False
                         step = max(-RETURN_STEP, min(RETURN_STEP, diff))
                         servo_targets[ch] = current_target + step
             if all_centered:
-                time.sleep(0.1)
+                was_sweeping = False
+        else:
+            # Not sweeping, not returning — idle
+            time.sleep(0.1)
+            continue
+
+        time.sleep(0.05)
+
+
+def track_shoot_worker():
+    """Track & Shoot: sweeps to find a person, tracks them to center,
+    shoots for 2 seconds, then continues tracking.
+    If person disappears for 10 seconds, resumes sweep."""
+    global track_shoot_active, sweep_active, flywheel_on, trigger_on
+
+    CENTER = {0: 88.0, 2: 67.0}
+    TRACK_GAIN = 0.15  # how aggressively to chase (degrees per pixel-fraction)
+    CENTERED_FRAMES_NEEDED = 3  # require N consecutive centered frames before shooting
+    LOST_TIMEOUT = 10.0  # seconds without detection before resuming sweep
+    centered_count = 0
+    last_seen_time = None  # timestamp of last person detection
+
+    while True:
+        if not track_shoot_active:
+            centered_count = 0
+            last_seen_time = None
+            time.sleep(0.1)
+            continue
+
+        with detection_lock:
+            detected = human_detected
+            centered = target_centered
+            dx = track_dx
+            dy = track_dy
+            fw = track_frame_w
+            fh = track_frame_h
+
+        if not detected:
+            centered_count = 0
+            now = time.monotonic()
+            if last_seen_time is None:
+                # First loop or just activated — start sweep immediately
+                if not sweep_active:
+                    sweep_active = True
+            elif now - last_seen_time >= LOST_TIMEOUT:
+                # Person lost for 10 seconds — resume sweep
+                if not sweep_active:
+                    sweep_active = True
+            # else: within 10s grace period, hold position (no sweep yet)
+            time.sleep(0.05)
+            continue
+
+        # Person detected — record time, stop sweep and track
+        last_seen_time = time.monotonic()
+        if sweep_active:
+            sweep_active = False
+
+        if centered:
+            centered_count += 1
+        else:
+            centered_count = 0
+            # Adjust servos proportionally to offset
+            # dx positive = target is to the right of frame = need to decrease ch0 angle
+            # dy positive = target is below center = need to increase ch2 angle
+            norm_dx = dx / (fw / 2)  # -1 to 1
+            norm_dy = dy / (fh / 2)  # -1 to 1
+            pan_adjust = -norm_dx * TRACK_GAIN * 90  # scale to degrees
+            tilt_adjust = norm_dy * TRACK_GAIN * 35   # ch2 has smaller range
+            with _servo_lock:
+                servo_targets[0] = max(0.0, min(180.0, servo_targets[0] + pan_adjust))
+                servo_targets[2] = max(30.0, min(100.0, servo_targets[2] + tilt_adjust))
+
+        if centered_count >= CENTERED_FRAMES_NEEDED:
+            # --- SHOOT sequence (2 seconds) ---
+            centered_count = 0
+
+            # Flywheel ON
+            _flywheel_relay.on()
+            flywheel_on = True
+            time.sleep(0.5)  # let flywheel spin up
+
+            if not track_shoot_active:
+                _flywheel_relay.off()
+                flywheel_on = False
                 continue
 
-        time.sleep(0.05)  # update targets at 20Hz, smooth worker handles actual movement
+            # Trigger ON
+            _trigger_relay.on()
+            trigger_on = True
+            time.sleep(2.0)  # shoot for 2 seconds
+
+            # Trigger OFF
+            _trigger_relay.off()
+            trigger_on = False
+            time.sleep(0.5)
+
+            # Flywheel OFF
+            _flywheel_relay.off()
+            flywheel_on = False
+
+            # Continue tracking (loop back)
+            continue
+
+        time.sleep(0.05)
 
 
 def draw_target(frame, head_x, head_y, r):
@@ -432,50 +642,94 @@ def draw_target(frame, head_x, head_y, r):
     cv2.line(frame, (head_x, head_y + gap), (head_x, head_y + ext), (0, 0, 255), 2)
 
 
-def generate_frames():
-    """Generator that yields MJPEG frames with overlays. No detection here — just drawing."""
+def draw_aim_zone(frame):
+    """Draw the calibration crosshair and the 'centered' threshold rectangle on the frame."""
+    h, w = frame.shape[:2]
+    cx = int(calibration['x'] * w)
+    cy = int(calibration['y'] * h)
+    thresh_x = w * 4 // 75
+    thresh_y = h * 8 // 75
+    # Threshold rectangle (the "shoot" zone)
+    cv2.rectangle(frame, (cx - thresh_x, cy - thresh_y), (cx + thresh_x, cy + thresh_y),
+                  (0, 255, 255), 3)
+    # Crosshair at calibration point
+    arm = 16
+    cv2.line(frame, (cx - arm, cy), (cx + arm, cy), (0, 255, 255), 2)
+    cv2.line(frame, (cx, cy - arm), (cx, cy + arm), (0, 255, 255), 2)
+
+
+# --- Pre-encoded stream frame (background thread encodes, generators just yield) ---
+_stream_buf = None
+_stream_lock = threading.Lock()
+STREAM_W, STREAM_H = 640, 360  # downscaled for fast encode + transfer
+
+
+def stream_encoder():
+    """Background thread: encodes stream frames at reduced resolution."""
+    global _stream_buf
+    prev_frame_id = None
     while True:
         with frame_lock:
             frame = latest_frame
-
         if frame is None:
-            time.sleep(0.03)
+            time.sleep(0.01)
             continue
+        # Skip if same frame object (no new camera read)
+        fid = id(frame)
+        if fid == prev_frame_id:
+            time.sleep(0.005)
+            continue
+        prev_frame_id = fid
 
         frame = apply_zoom(frame.copy(), zoom_level)
+        # Downscale for stream
+        small = cv2.resize(frame, (STREAM_W, STREAM_H), interpolation=cv2.INTER_NEAREST)
+        draw_aim_zone(small)
 
-        # Draw detection overlays from the detection thread
         with detection_lock:
             boxes = detection_boxes.copy()
             detected = human_detected
             count = human_count
 
         if detected and boxes:
+            # Scale detection boxes to stream resolution
+            fh, fw = frame.shape[:2]
+            sx, sy = STREAM_W / fw, STREAM_H / fh
             for (x, y, w, h) in boxes:
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                head_x = x + w // 2
-                head_y = y + int(h * 0.1)
-                r = max(18, w // 6)
-                draw_target(frame, head_x, head_y, r)
+                rx, ry, rw, rh = int(x*sx), int(y*sy), int(w*sx), int(h*sy)
+                cv2.rectangle(small, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), 2)
+                head_x = rx + rw // 2
+                head_y = ry + int(rh * 0.1)
+                r = max(12, rw // 6)
+                draw_target(small, head_x, head_y, r)
+            cv2.putText(small, f"HUMAN DETECTED ({count})", (8, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            label = f"HUMAN DETECTED ({count})"
-            cv2.putText(frame, label, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-
-        # Timestamp
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        cv2.putText(frame, ts, (10, frame.shape[0] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-        # Zoom indicator
+        cv2.putText(small, ts, (8, STREAM_H - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         if zoom_level > 1.0:
-            cv2.putText(frame, f"{zoom_level:.1f}x", (frame.shape[1] - 80, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(small, f"{zoom_level:.1f}x", (STREAM_W - 60, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
-        time.sleep(0.033)  # ~30fps cap to prevent flooding
+        _, buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        encoded = (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
+        with _stream_lock:
+            _stream_buf = encoded
+
+
+def generate_frames():
+    """Generator that yields pre-encoded MJPEG frames."""
+    prev = None
+    while True:
+        with _stream_lock:
+            buf = _stream_buf
+        if buf is None or buf is prev:
+            time.sleep(0.005)
+            continue
+        prev = buf
+        yield buf
 
 
 @app.route('/')
@@ -497,6 +751,7 @@ def single_frame():
     if frame is None:
         return "No frame", 503
     frame = apply_zoom(frame.copy(), zoom_level)
+    draw_aim_zone(frame)
 
     with detection_lock:
         boxes = detection_boxes.copy()
@@ -626,19 +881,55 @@ def sweep_control():
     return jsonify(sweep=sweep_active)
 
 
+@app.route('/track_shoot', methods=['POST'])
+def track_shoot_control():
+    global track_shoot_active, sweep_active, flywheel_on, trigger_on
+    data = request.get_json(force=True)
+    state = bool(data.get('state', False))
+    track_shoot_active = state
+    if not state:
+        # Deactivating: stop sweep, stop flywheel/trigger, return to center
+        sweep_active = False
+        _flywheel_relay.off()
+        flywheel_on = False
+        _trigger_relay.off()
+        trigger_on = False
+        with _servo_lock:
+            servo_targets[0] = 88.0
+            servo_targets[2] = 67.0
+    return jsonify(track_shoot=track_shoot_active)
+
+
 @app.route('/reset', methods=['POST'])
 def reset_all():
-    """Stop sweep, flywheel, trigger, and return servos to center."""
-    global sweep_active, flywheel_on, trigger_on
+    """Stop sweep, flywheel, trigger, track_shoot, and return servos to center."""
+    global sweep_active, flywheel_on, trigger_on, track_shoot_active
     sweep_active = False
+    track_shoot_active = False
     _flywheel_relay.off()
     flywheel_on = False
     _trigger_relay.off()
     trigger_on = False
     with _servo_lock:
-        servo_targets[0] = 90.0
-        servo_targets[2] = 110.0
+        servo_targets[0] = 88.0
+        servo_targets[2] = 67.0
     return jsonify(ok=True)
+
+
+@app.route('/calibration', methods=['GET'])
+def get_calibration():
+    return jsonify(x=calibration['x'], y=calibration['y'])
+
+
+@app.route('/calibration', methods=['POST'])
+def set_calibration():
+    data = request.get_json(force=True)
+    calibration['x'] = max(0.0, min(1.0, float(data.get('x', 0.5))))
+    calibration['y'] = max(0.0, min(1.0, float(data.get('y', 0.5))))
+    with open(CALIBRATION_FILE, 'w') as f:
+        json.dump({'x': calibration['x'], 'y': calibration['y']}, f)
+    print(f"Calibration saved: x={calibration['x']:.3f}, y={calibration['y']:.3f}")
+    return jsonify(x=calibration['x'], y=calibration['y'])
 
 
 @app.route('/status')
@@ -648,8 +939,10 @@ def status():
         human_detected=human_detected,
         human_count=human_count,
         target_centered=target_centered,
+        aim_direction=aim_direction,
         flywheel=flywheel_on,
         trigger=trigger_on,
+        track_shoot=track_shoot_active,
         servo_angles=servo_angles
     )
 
@@ -699,6 +992,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: rgba(0,0,0,0.4); color: #8f8;
   }
   #status-badge.alert { background: #e94560; color: #fff; }
+  .tab-bar {
+    display: flex; background: rgba(0,0,0,0.3);
+    border-bottom: 2px solid rgba(255,255,255,0.15);
+  }
+  .tab-btn {
+    flex: 1; padding: 8px 0; text-align: center; cursor: pointer;
+    font-size: 0.85rem; font-weight: 600; color: #aaa;
+    background: transparent; border: none; border-bottom: 3px solid transparent;
+    transition: color 0.2s, border-color 0.2s;
+  }
+  .tab-btn.active { color: #fff; border-bottom-color: #ff8800; }
+  .tab-btn:hover { color: #ddd; }
+  .tab-content { display: none; flex: 1; flex-direction: column; overflow: hidden; }
+  .tab-content.active { display: flex; }
   .feed-container {
     flex: 1; display: flex; align-items: center; justify-content: center;
     overflow: hidden; background: #000;
@@ -763,12 +1070,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .btn-reset {
     background: linear-gradient(135deg, #666, #444); color: #fff;
-    font-size: 0.85rem; padding: 10px 18px; align-self: center;
+    font-size: 1rem; padding: 10px 22px; align-self: center;
   }
+  .btn-shoot {
+    background: linear-gradient(135deg, #cc0000, #880000); color: #fff;
+    font-size: 1.1rem; padding: 14px 24px; align-self: center; font-weight: 700;
+  }
+  .btn-shoot.on { background: linear-gradient(135deg, #ff0000, #ff4400); box-shadow: 0 0 20px rgba(255,0,0,0.7); }
+  .btn-track-shoot {
+    background: linear-gradient(135deg, #ff4400, #cc0088); color: #fff;
+    font-size: 1rem; padding: 10px 22px; font-weight: 700;
+  }
+  .btn-track-shoot.on { background: linear-gradient(135deg, #ff0044, #ff00cc); box-shadow: 0 0 20px rgba(255,0,136,0.7); }
   .joystick-container {
     position: relative; width: 150px; height: 150px;
     background: conic-gradient(#ff0000, #ff8800, #ffff00, #00cc00, #0088ff, #8800ff, #ff0000);
-    border-radius: 50%; border: 3px solid rgba(255,255,255,0.3);
+    border-radius: 8px; border: 3px solid rgba(255,255,255,0.3);
     touch-action: none; user-select: none;
   }
   .joystick-knob {
@@ -776,7 +1093,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: radial-gradient(circle, #fff, #ddd);
     border: 2px solid rgba(0,0,0,0.3);
     border-radius: 50%;
-    top: 38.9%; left: 50%; transform: translate(-50%, -50%);
+    top: 47.1%; left: 51.1%; transform: translate(-50%, -50%);
     pointer-events: none;
     box-shadow: 0 0 10px rgba(0,0,0,0.4);
   }
@@ -795,43 +1112,63 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <span id="status-badge">Monitoring</span>
   </header>
 
-  <div class="feed-container">
-    <img id="feed" alt="Live Feed">
+  <div class="tab-bar">
+    <button class="tab-btn active" onclick="switchTab('control')">Control</button>
+    <button class="tab-btn" onclick="switchTab('calibration')">Calibration</button>
   </div>
 
-  <div class="controls">
-    <button class="btn btn-flywheel" id="flywheel-btn" onclick="toggleFlywheel()">FLYWHEEL</button>
-    <button class="btn btn-sweep" id="sweep-btn" onclick="toggleSweep()">SWEEP</button>
-    <button class="btn btn-trigger" id="trigger-btn"
-            onmousedown="triggerStart()" onmouseup="triggerStop()" onmouseleave="triggerStop()"
-            ontouchstart="triggerStart(event)" ontouchend="triggerStop()" ontouchcancel="triggerStop()">TRIGGER</button>
+  <div class="tab-content active" id="tab-control">
+    <div class="feed-container" style="cursor:crosshair;">
+      <img id="feed" alt="Live Feed">
+    </div>
 
-    <div class="joystick-wrap">
-      <div>
-        <div class="joystick-container" id="joystick">
-          <div class="joystick-knob" id="joystick-knob"></div>
+    <div class="controls">
+      <button class="btn btn-flywheel" id="flywheel-btn" onclick="toggleFlywheel()">FLYWHEEL</button>
+      <button class="btn btn-sweep" id="sweep-btn" onclick="toggleSweep()">SWEEP</button>
+      <button class="btn btn-track-shoot" id="track-shoot-btn" onclick="toggleTrackShoot()">TRACK&amp;SHOOT</button>
+      <button class="btn btn-trigger" id="trigger-btn"
+              onmousedown="triggerStart()" onmouseup="triggerStop()" onmouseleave="triggerStop()"
+              ontouchstart="triggerStart(event)" ontouchend="triggerStop()" ontouchcancel="triggerStop()">TRIGGER</button>
+
+      <div class="joystick-wrap">
+        <div>
+          <div class="joystick-container" id="joystick">
+            <div class="joystick-knob" id="joystick-knob"></div>
+          </div>
+          <div class="joystick-label">L/R: pan &middot; U/D: tilt</div>
         </div>
-        <div class="joystick-label">L/R: pan &middot; U/D: tilt</div>
+        <button class="btn btn-reset" onclick="resetAll()">RESET</button>
+        <button class="btn btn-shoot" id="shoot-btn"
+                onmousedown="shootStart()" onmouseup="shootStop()" onmouseleave="shootStop()"
+                ontouchstart="shootStart(event)" ontouchend="shootStop()" ontouchcancel="shootStop()">SHOOT</button>
       </div>
-      <button class="btn btn-reset" onclick="resetAll()">RESET</button>
-    </div>
 
-    <div class="zoom-row">
-      <button class="btn btn-zoom" onclick="changeZoom(-0.5)">&#x2212;</button>
-      <label>Zoom</label>
-      <input type="range" id="zoom-slider" min="1" max="5" step="0.1" value="1"
-             oninput="setZoom(this.value)">
-      <span class="zoom-val" id="zoom-val">1.0x</span>
-      <button class="btn btn-zoom" onclick="changeZoom(0.5)">+</button>
+      <div class="zoom-row">
+        <button class="btn btn-zoom" onclick="changeZoom(-0.5)">&#x2212;</button>
+        <label>Zoom</label>
+        <input type="range" id="zoom-slider" min="1" max="5" step="0.1" value="1"
+               oninput="setZoom(this.value)">
+        <span class="zoom-val" id="zoom-val">1.0x</span>
+        <button class="btn btn-zoom" onclick="changeZoom(0.5)">+</button>
+      </div>
+      <button class="btn btn-snap" onclick="takeSnapshot()">Snapshot</button>
+      <button class="btn btn-sound" id="sound-btn" onclick="enableSound()">Enable Sound</button>
     </div>
-    <div class="zoom-row">
-      <label>Focus</label>
-      <input type="range" id="focus-slider" min="1" max="1023" step="1" value="150"
-             oninput="setFocus(this.value)">
-      <span class="zoom-val" id="focus-val">150</span>
+  </div>
+
+  <div class="tab-content" id="tab-calibration">
+    <div class="feed-container" style="position:relative; cursor:crosshair;">
+      <img id="cal-feed" alt="Calibration Feed" style="max-width:100%; max-height:100%; object-fit:contain;">
+      <svg id="cal-overlay" style="position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none;"></svg>
     </div>
-    <button class="btn btn-snap" onclick="takeSnapshot()">Snapshot</button>
-    <button class="btn btn-sound" id="sound-btn" onclick="enableSound()">Enable Sound</button>
+    <div class="controls" style="justify-content:center; gap:16px;">
+      <div style="font-size:0.85rem; text-align:center;">
+        <span style="animation: rainbow-text 3s linear infinite;">Tap where the gun is actually pointing</span><br>
+        <span id="cal-coords" style="color:#ff8800; font-size:0.8rem;"></span>
+      </div>
+      <button class="btn btn-snap" id="cal-submit" onclick="submitCalibration()" style="opacity:0.4; pointer-events:none;">SAVE CALIBRATION</button>
+      <button class="btn btn-reset" onclick="clearCalibration()">CLEAR</button>
+    </div>
   </div>
 
 <script>
@@ -873,20 +1210,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     window.location.href = '/snapshot';
   }
 
-  // Frame polling via fetch() to read headers + image
+  // MJPEG stream for low-latency video (single persistent connection)
   const feed = document.getElementById('feed');
-  let fetching = false;
-  function fetchFrame() {
-    if (fetching) return;
-    fetching = true;
-    fetch('/frame?' + Date.now())
-      .then(r => {
-        // Read detection state from headers
-        const isHuman = r.headers.get('X-Human') === '1';
-        const count = r.headers.get('X-Count') || '0';
-        const centered = r.headers.get('X-Centered') === '1';
-        const direction = r.headers.get('X-Direction') || '';
+  feed.src = '/video_feed';
 
+  // Lightweight status poll for detection badges and sound
+  function pollStatus() {
+    fetch('/status')
+      .then(r => r.json())
+      .then(data => {
+        const isHuman = data.human_detected;
+        const count = data.human_count;
+        const centered = data.target_centered;
+        const direction = data.aim_direction || '';
         if (isHuman) {
           badge.textContent = 'Human Detected (' + count + ')';
           badge.classList.add('alert');
@@ -894,7 +1230,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
           badge.textContent = 'Monitoring';
           badge.classList.remove('alert');
         }
-        // Sound: gunshot if centered, direction tones if off-center, silence if no human
         if (isHuman && centered) {
           updateSound(true, '');
         } else if (isHuman && direction) {
@@ -902,22 +1237,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         } else {
           updateSound(false, '');
         }
-
-        return r.blob();
       })
-      .then(blob => {
-        const url = URL.createObjectURL(blob);
-        feed.onload = () => URL.revokeObjectURL(url);
-        feed.src = url;
-        fetching = false;
-        setTimeout(fetchFrame, 100);
-      })
-      .catch(() => {
-        fetching = false;
-        setTimeout(fetchFrame, 500);
-      });
+      .catch(() => {});
   }
-  fetchFrame();
+  setInterval(pollStatus, 200);
 
   // --- Sound system (all Web Audio API, no speechSynthesis) ---
   let audioCtx = null;
@@ -1039,13 +1362,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
     flywheelBtn.textContent = 'FLYWHEEL';
     triggerActive = false;
     triggerBtn.classList.remove('on');
-    // Reset joystick knob to resting position (X=center, Y=up for 110°)
-    // Y mapping: targetY = 90 - (dy/r)*90, so for 110°: dy/r = -20/90
-    knob.style.left = '50%';
-    knob.style.top = (50 - 20/90 * 50).toFixed(1) + '%';
+    trackShootActive = false;
+    trackShootBtn.classList.remove('on');
+    trackShootBtn.textContent = 'TRACK&SHOOT';
+    // Reset joystick knob to resting position (pan=88, tilt=67)
+    targetX = 88; targetY = 67;
+    lastSentX = 88; lastSentY = 67;
+    const r = joystick.offsetWidth / 2;
+    const dx = (90 - 88) / 90 * r;
+    const dy = (65 - 67) / 35 * r;
+    knob.style.left = (r + dx) + 'px';
+    knob.style.top = (r + dy) + 'px';
     joyRect = null;
-    targetX = 90; targetY = 110;
-    lastSentX = 90; lastSentY = 110;
   }
 
   // --- Sweep toggle ---
@@ -1101,14 +1429,97 @@ HTML_PAGE = r"""<!DOCTYPE html>
     });
   }
 
+  // --- SHOOT button: flywheel on immediately, trigger after 0.5s delay ---
+  const shootBtn = document.getElementById('shoot-btn');
+  let shootActive = false;
+  let shootTriggerTimer = null;
+  let shootFlywheelOffTimer = null;
+  function shootStart(e) {
+    if (e) e.preventDefault();
+    if (shootActive) return;
+    shootActive = true;
+    shootBtn.classList.add('on');
+    // Turn on flywheel immediately
+    if (shootFlywheelOffTimer) { clearTimeout(shootFlywheelOffTimer); shootFlywheelOffTimer = null; }
+    fetch('/flywheel', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({state: true})
+    });
+    flywheelActive = true;
+    flywheelBtn.classList.add('on');
+    flywheelBtn.textContent = 'FLYWHEEL ON';
+    // Turn on trigger after 0.5s
+    shootTriggerTimer = setTimeout(() => {
+      fetch('/trigger', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({state: true})
+      });
+      triggerActive = true;
+      triggerBtn.classList.add('on');
+    }, 500);
+  }
+  function shootStop() {
+    if (!shootActive) return;
+    shootActive = false;
+    shootBtn.classList.remove('on');
+    // Cancel trigger timer if not yet fired
+    if (shootTriggerTimer) { clearTimeout(shootTriggerTimer); shootTriggerTimer = null; }
+    // Turn off trigger immediately
+    fetch('/trigger', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({state: false})
+    });
+    triggerActive = false;
+    triggerBtn.classList.remove('on');
+    // Turn off flywheel after 0.5s
+    shootFlywheelOffTimer = setTimeout(() => {
+      fetch('/flywheel', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({state: false})
+      });
+      flywheelActive = false;
+      flywheelBtn.classList.remove('on');
+      flywheelBtn.textContent = 'FLYWHEEL';
+    }, 500);
+  }
+
+  // --- Track & Shoot toggle ---
+  const trackShootBtn = document.getElementById('track-shoot-btn');
+  let trackShootActive = false;
+  function toggleTrackShoot() {
+    trackShootActive = !trackShootActive;
+    trackShootBtn.classList.toggle('on', trackShootActive);
+    trackShootBtn.textContent = trackShootActive ? 'TRACK&SHOOT ON' : 'TRACK&SHOOT';
+    fetch('/track_shoot', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({state: trackShootActive})
+    });
+    if (!trackShootActive) {
+      // UI sync: sweep off, flywheel/trigger off
+      sweepActive = false;
+      sweepBtn.classList.remove('on');
+      sweepBtn.textContent = 'SWEEP';
+      flywheelActive = false;
+      flywheelBtn.classList.remove('on');
+      flywheelBtn.textContent = 'FLYWHEEL';
+      triggerActive = false;
+      triggerBtn.classList.remove('on');
+    }
+  }
+
   // --- Joystick control (servo 0 = L/R, servo 2 = U/D) ---
   const joystick = document.getElementById('joystick');
   const knob = document.getElementById('joystick-knob');
   let joyActive = false;
   let joyRect = null;
   // Target angles — server does all smoothing
-  let targetX = 90, targetY = 110;
-  let lastSentX = 90, lastSentY = 110;
+  let targetX = 88, targetY = 67;
+  let lastSentX = 88, lastSentY = 67;
 
   // Send target to server periodically (no client-side interpolation)
   setInterval(() => {
@@ -1125,17 +1536,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const r = joyRect.width / 2;
     let dx = clientX - (joyRect.left + r);
     let dy = clientY - (joyRect.top + r);
-    // Clamp to circle
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist > r) { dx = dx / dist * r; dy = dy / dist * r; }
-    // Position knob
+    // Clamp to square
+    dx = Math.max(-r, Math.min(r, dx));
+    dy = Math.max(-r, Math.min(r, dy));
+    // Position knob (follows finger/mouse)
     knob.style.left = (r + dx) + 'px';
     knob.style.top = (r + dy) + 'px';
-    // Map to target servo angles (full range)
+    // Map to target servo angles (invert dy: drag up = negative dy = tilt up = lower angle)
     targetX = Math.round(90 - (dx / r) * 90);
-    targetY = Math.round(90 - (dy / r) * 90);
+    targetY = Math.round(65 + (dy / r) * 35);
     targetX = Math.max(0, Math.min(180, targetX));
-    targetY = Math.max(30, Math.min(110, targetY));
+    targetY = Math.max(30, Math.min(100, targetY));
   }
 
   let servoThrottle = {};
@@ -1183,6 +1594,199 @@ HTML_PAGE = r"""<!DOCTYPE html>
     if (joyActive) joyEnd();
   });
 
+  // --- Sync joystick knob with actual servo position when user isn't touching it ---
+  setInterval(() => {
+    if (joyActive) return;
+    fetch('/status')
+      .then(r => r.json())
+      .then(data => {
+        if (joyActive) return;
+        const angles = data.servo_angles;
+        if (!angles) return;
+        const ax = angles['0'] ?? 90;
+        const ay = angles['2'] ?? 100;
+        targetX = ax; targetY = ay;
+        lastSentX = ax; lastSentY = ay;
+        // Convert angles back to knob pixel position
+        const r = joystick.offsetWidth / 2;
+        const dx = (90 - ax) / 90 * r;
+        const dy = (ay - 65) / 35 * r;
+        knob.style.left = (r + dx) + 'px';
+        knob.style.top = (r + dy) + 'px';
+      })
+      .catch(() => {});
+  }, 200);
+
+  // --- Tab switching ---
+  function switchTab(name) {
+    document.querySelectorAll('.tab-btn').forEach((b, i) => {
+      b.classList.toggle('active', (i === 0 && name === 'control') || (i === 1 && name === 'calibration'));
+    });
+    document.getElementById('tab-control').classList.toggle('active', name === 'control');
+    document.getElementById('tab-calibration').classList.toggle('active', name === 'calibration');
+    if (name === 'calibration') startCalFeed();
+    else stopCalFeed();
+  }
+
+  // --- Calibration ---
+  const calFeed = document.getElementById('cal-feed');
+  const calOverlay = document.getElementById('cal-overlay');
+  const calCoords = document.getElementById('cal-coords');
+  const calSubmit = document.getElementById('cal-submit');
+  let calInterval = null;
+  let calPendingX = null, calPendingY = null;  // normalized 0-1
+  let calSavedX = 0.5, calSavedY = 0.5;
+
+  // Load saved calibration on startup
+  fetch('/calibration').then(r => r.json()).then(data => {
+    calSavedX = data.x; calSavedY = data.y;
+    calCoords.textContent = 'Saved: (' + (data.x * 100).toFixed(1) + '%, ' + (data.y * 100).toFixed(1) + '%)';
+  }).catch(() => {});
+
+  function startCalFeed() {
+    if (calInterval) return;
+    fetchCalFrame();
+    calInterval = setInterval(fetchCalFrame, 200);
+    drawCalMarkers();
+  }
+  function stopCalFeed() {
+    if (calInterval) { clearInterval(calInterval); calInterval = null; }
+  }
+  function fetchCalFrame() {
+    fetch('/frame?' + Date.now())
+      .then(r => r.blob())
+      .then(blob => {
+        const url = URL.createObjectURL(blob);
+        calFeed.onload = () => { URL.revokeObjectURL(url); drawCalMarkers(); };
+        calFeed.src = url;
+      }).catch(() => {});
+  }
+
+  function drawCalMarkers() {
+    const img = calFeed;
+    if (!img.naturalWidth) return;
+    const container = img.parentElement;
+    const contW = container.clientWidth, contH = container.clientHeight;
+    const imgW = img.naturalWidth, imgH = img.naturalHeight;
+    // Compute displayed image rect (object-fit:contain)
+    const scale = Math.min(contW / imgW, contH / imgH);
+    const dispW = imgW * scale, dispH = imgH * scale;
+    const offX = (contW - dispW) / 2, offY = (contH - dispH) / 2;
+
+    let svg = '';
+    // Draw saved calibration as a small circle
+    const sx = offX + calSavedX * dispW, sy = offY + calSavedY * dispH;
+    svg += '<circle cx="' + sx + '" cy="' + sy + '" r="6" fill="none" stroke="#00ff88" stroke-width="2"/>';
+    svg += '<line x1="' + (sx-10) + '" y1="' + sy + '" x2="' + (sx+10) + '" y2="' + sy + '" stroke="#00ff88" stroke-width="1"/>';
+    svg += '<line x1="' + sx + '" y1="' + (sy-10) + '" x2="' + sx + '" y2="' + (sy+10) + '" stroke="#00ff88" stroke-width="1"/>';
+
+    // Draw pending mark as red X
+    if (calPendingX !== null) {
+      const px = offX + calPendingX * dispW, py = offY + calPendingY * dispH;
+      const s = 14;
+      svg += '<line x1="' + (px-s) + '" y1="' + (py-s) + '" x2="' + (px+s) + '" y2="' + (py+s) + '" stroke="#ff0000" stroke-width="3"/>';
+      svg += '<line x1="' + (px+s) + '" y1="' + (py-s) + '" x2="' + (px-s) + '" y2="' + (py+s) + '" stroke="#ff0000" stroke-width="3"/>';
+    }
+    calOverlay.innerHTML = svg;
+  }
+
+  // Tap/click handler on calibration feed container
+  document.querySelector('#tab-calibration .feed-container').addEventListener('click', function(e) {
+    const img = calFeed;
+    if (!img.naturalWidth) return;
+    const container = this;
+    const rect = container.getBoundingClientRect();
+    const clickX = e.clientX - rect.left, clickY = e.clientY - rect.top;
+    const contW = container.clientWidth, contH = container.clientHeight;
+    const imgW = img.naturalWidth, imgH = img.naturalHeight;
+    const scale = Math.min(contW / imgW, contH / imgH);
+    const dispW = imgW * scale, dispH = imgH * scale;
+    const offX = (contW - dispW) / 2, offY = (contH - dispH) / 2;
+    // Check if click is within the image area
+    const relX = clickX - offX, relY = clickY - offY;
+    if (relX < 0 || relX > dispW || relY < 0 || relY > dispH) return;
+    calPendingX = relX / dispW;
+    calPendingY = relY / dispH;
+    calSubmit.style.opacity = '1';
+    calSubmit.style.pointerEvents = 'auto';
+    calCoords.textContent = 'New: (' + (calPendingX * 100).toFixed(1) + '%, ' + (calPendingY * 100).toFixed(1) + '%)';
+    drawCalMarkers();
+  });
+  // Touch support
+  document.querySelector('#tab-calibration .feed-container').addEventListener('touchend', function(e) {
+    if (e.changedTouches.length === 0) return;
+    const touch = e.changedTouches[0];
+    const rect = this.getBoundingClientRect();
+    const evt = {clientX: touch.clientX, clientY: touch.clientY};
+    // Simulate click
+    const clickEvt = new MouseEvent('click', {clientX: touch.clientX, clientY: touch.clientY});
+    this.dispatchEvent(clickEvt);
+    e.preventDefault();
+  });
+
+  function submitCalibration() {
+    if (calPendingX === null) return;
+    fetch('/calibration', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({x: calPendingX, y: calPendingY})
+    }).then(r => r.json()).then(data => {
+      calSavedX = data.x; calSavedY = data.y;
+      calPendingX = null; calPendingY = null;
+      calSubmit.style.opacity = '0.4';
+      calSubmit.style.pointerEvents = 'none';
+      calCoords.textContent = 'Saved: (' + (data.x * 100).toFixed(1) + '%, ' + (data.y * 100).toFixed(1) + '%)';
+      drawCalMarkers();
+    }).catch(() => { calCoords.textContent = 'Save failed!'; });
+  }
+
+  function clearCalibration() {
+    calPendingX = null; calPendingY = null;
+    calSubmit.style.opacity = '0.4';
+    calSubmit.style.pointerEvents = 'none';
+    calCoords.textContent = 'Saved: (' + (calSavedX * 100).toFixed(1) + '%, ' + (calSavedY * 100).toFixed(1) + '%)';
+    drawCalMarkers();
+  }
+
+  // --- Tap-to-aim on the control feed ---
+  const feedContainer = document.querySelector('#tab-control .feed-container');
+  function handleFeedTap(e) {
+    const img = feed;
+    if (!img.naturalWidth) return;
+    const container = img.parentElement;
+    const contRect = container.getBoundingClientRect();
+    const imgW = img.naturalWidth, imgH = img.naturalHeight;
+    const scale = Math.min(contRect.width / imgW, contRect.height / imgH);
+    const dispW = imgW * scale, dispH = imgH * scale;
+    const offX = (contRect.width - dispW) / 2;
+    const offY = (contRect.height - dispH) / 2;
+    const relX = (e.clientX - contRect.left - offX) / dispW;
+    const relY = (e.clientY - contRect.top - offY) / dispH;
+    if (relX < 0 || relX > 1 || relY < 0 || relY > 1) return;
+    // Offset from calibrated aim center (positive = tap is right/below)
+    const dx = relX - calSavedX;
+    const dy = relY - calSavedY;
+    // Convert to servo deltas, scaled by zoom (narrower FOV = smaller adjustment)
+    const z = parseFloat(slider.value) || 1;
+    const panDelta = -dx * 70 / z;
+    const tiltDelta = dy * 40 / z;
+    // Set new targets (overrides any previous movement)
+    targetX = Math.max(0, Math.min(180, targetX + panDelta));
+    targetY = Math.max(30, Math.min(100, targetY + tiltDelta));
+    lastSentX = -1; lastSentY = -1;
+    fetch('/servo', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({channel:0, angle:targetX})});
+    fetch('/servo', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({channel:2, angle:targetY})});
+  }
+  feedContainer.addEventListener('click', handleFeedTap);
+  feedContainer.addEventListener('touchend', function(e) {
+    if (e.changedTouches.length === 0) return;
+    const t = e.changedTouches[0];
+    handleFeedTap({clientX: t.clientX, clientY: t.clientY});
+    e.preventDefault();
+  });
+
   function updateSound(centered, direction) {
     if (!soundEnabled) return;
     if (centered) {
@@ -1217,6 +1821,10 @@ servo_thread = threading.Thread(target=servo_smooth_worker, daemon=True)
 servo_thread.start()
 sweep_thread = threading.Thread(target=sweep_worker, daemon=True)
 sweep_thread.start()
+track_shoot_thread = threading.Thread(target=track_shoot_worker, daemon=True)
+track_shoot_thread.start()
+stream_thread = threading.Thread(target=stream_encoder, daemon=True)
+stream_thread.start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=927, threaded=True)
